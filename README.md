@@ -1,0 +1,136 @@
+# OCI 层叠加与卷挂载排障接口
+
+容器启动时报「找不到配置文件」时，值班员需要判断问题出在**镜像构建**（层叠加、
+whiteout、软链接）还是**卷挂载**（挂载点把镜像内容盖住）。本服务用 FastAPI
+模拟这两套机制，对同一个待查路径分别给出**挂载前**与**挂载后**的解析结果。
+
+## 能力范围
+
+- 按「底到顶」顺序上传多个**未压缩** OCI 层 tar，只读取 tar 条目元数据，
+  不落盘、不提取文件内容；
+- 镜像层条目支持：普通文件、目录、软链接、whiteout（`.wh.<name>`）、
+  不透明目录标记（`.wh..wh..opq`）；
+- 叠加语义：whiteout 只遮蔽更下层，同层新增同路径条目照常可见（两阶段处理，
+  与 tar 内顺序无关）；不透明标记遮蔽目录的下层内容，目录本身与上层新增保留；
+- 挂载点必须是镜像里存在的目录，且多个挂载点**互不嵌套**；
+- 卷只含文件和目录；挂载后挂载点目录内的镜像内容被整体盖住；
+- 容器内逐分量解析软链接，支持相对/绝对目标、**跨挂载点**跳转；
+  与 Linux `stat(2)` 语义一致：软链接作为路径末分量时返回链接本身
+  （`entry_type=symlink`），只有链接后还有子分量时才跟随；
+  跟随过程成环返回 `symlink_cycle`，跳数超 40 返回 `too_many_symlink_hops`；
+- 查找命中时返回实际路径、类型、来源层（layer_index，0 为最底层）或来源卷；
+  中断时返回断在哪一分量、绝对位置与具体原因（含遮蔽来源挂载点）。
+
+## 目录结构
+
+```
+app/
+  errors.py      # 统一业务异常（400 tar 不可读 / 422 输入不合法）
+  tarloader.py   # 只读解析未压缩层 tar -> 有序事件
+  imagefs.py     # 底到顶层合并（whiteout / opaque / 覆盖）+ 挂载点校验
+  volume.py      # 卷清单解析（仅 file/dir，父目录必须显式声明）
+  resolver.py    # 容器视图、软链接跟随、跨挂载、成环检测
+  main.py        # FastAPI 路由与响应模型
+tests/           # 27 个 pytest 用例
+scripts/
+  e2e_smoke.py   # 端到端冒烟脚本（造层 -> 打接口 -> 断言）
+Dockerfile
+docker-compose.yml
+```
+
+## 用 Docker Compose 启动
+
+```bash
+docker compose up --build
+# 打开交互文档
+open http://localhost:8000/docs      # Linux: xdg-open http://localhost:8000/docs
+```
+
+`/docs` 里可直接试用 `POST /api/troubleshoot`，响应中并排展示
+`before_mount` 与 `after_mount` 两组结果。
+
+## 本地开发（无 Docker 时）
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/uvicorn app.main:app --reload
+.venv/bin/python -I -m pytest tests/ -q          # 单元/接口测试
+.venv/bin/python -I scripts/e2e_smoke.py         # 起服务后的端到端冒烟
+```
+
+## 请求格式（multipart/form-data）
+
+| 字段 | 形式 | 说明 |
+| --- | --- | --- |
+| `layers` | 文件，可重复 | 未压缩 tar，重复字段的顺序 = 最底层 → 最顶层 |
+| `target_path` | 字符串 | 待查容器内绝对路径，如 `/etc/app/config.yaml` |
+| `mount_points` | JSON 字符串 | 挂载点数组，如 `["/etc/app","/var/lib/app"]` |
+| `volume_entries` | JSON 字符串 | 挂载点 → 卷条目清单，路径相对卷根，仅 `file`/`dir` |
+
+`volume_entries` 示例：
+
+```json
+{
+  "/etc/app": [
+    {"path": "mounted.yaml", "type": "file"},
+    {"path": "sub", "type": "dir"},
+    {"path": "sub/v", "type": "file"}
+  ],
+  "/var/lib/app": []
+}
+```
+
+## 响应解读
+
+命中：
+
+```json
+{
+  "status": "found",
+  "actual_path": "/etc/app/mounted.yaml",
+  "entry_type": "file",
+  "source": {"origin": "volume", "mountpoint": "/etc/app"},
+  "shadowed_by_mount": "/etc/app",
+  "symlink_hops": [
+    {"symlink_path": "/appcfg", "target": "/etc/app/mounted.yaml", "resolved_from": "/"}
+  ]
+}
+```
+
+中断（注意 `broken_segment` / `broken_at` / `reason` 三段式定位，
+以及 `shadowed_by_mount` 提示镜像内容被卷盖住）：
+
+```json
+{
+  "status": "missing",
+  "broken_segment": "config.yaml",
+  "broken_at": "/etc/app/config.yaml",
+  "reason": "卷 /etc/app 的条目清单中不存在 /config.yaml",
+  "shadowed_by_mount": "/etc/app"
+}
+```
+
+成环：
+
+```json
+{"status": "error", "error_code": "symlink_cycle",
+ "reason": "软链接解析在 /cycle1 处成环（ELOOP）"}
+```
+
+## 排障判断指引
+
+- 挂载前 missing、挂载后也 missing：问题在镜像构建（路径不存在 / 被 whiteout /
+  不透明目录遮蔽 / 软链接断链），`reason` 会指出具体机制与层号；
+- 挂载前 found、挂载后 missing 且带 `shadowed_by_mount`：问题在卷挂载，
+  镜像里的文件被卷目录盖住；
+- `status=error` + `symlink_cycle`：镜像里的软链接本身成环，与卷无关。
+
+## 约束与限制
+
+- 仅接受未压缩 tar；gzip/xz/zstd/bzip2 流会被魔数识别并明确拒绝；
+- 不支持 hardlink、设备节点、FIFO 等条目（返回 422）；whiteout / 不透明
+  标记按 OCI 惯例接受任意条目类型，仅以 `.wh.` 名称识别；
+- 卷内不允许软链接；卷清单的每个父目录必须显式声明；
+- 单层上限 128 MiB、总计 384 MiB、单层 5 万条目（防御性阈值）；
+- 同层 tar 内出现重复路径条目会被拒绝（层间覆盖才是合法叠加方式）。
