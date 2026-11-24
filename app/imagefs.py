@@ -45,6 +45,17 @@ class ImageTree:
 
         return self.entries.get(parts)
 
+    def subtree_items(self, root: tuple[str, ...]):
+        """产出 root 之下（不含 root 自身）的全部条目，供子树遍历使用。
+
+        root 为 () 时表示镜像根，产出所有条目。条目含 Tomb，
+        是否「最终可见」由调用方按逐分量可达规则判断。
+        """
+
+        for parts, entry in self.entries.items():
+            if len(parts) > len(root) and parts[: len(root)] == root:
+                yield parts, entry
+
 
 def build_image_tree(layers: list[list[LayerEvent]]) -> ImageTree:
     """按层列表（索引 0 为最底层）合并出镜像视图。"""

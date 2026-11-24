@@ -26,3 +26,24 @@ class InvalidInputError(TroubleshootError):
 
     def __init__(self, message: str):
         super().__init__(message, status_code=422)
+
+
+class NotFoundError(TroubleshootError):
+    """按名查找的资源不存在（404）。"""
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=404)
+
+
+class ConflictError(TroubleshootError):
+    """与现有状态冲突（409），如卷名被残留目录占用。"""
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=409)
+
+
+class VolumeStorageError(TroubleshootError):
+    """持久卷写盘失败（500）；卷未生效，可重新初始化。"""
+
+    def __init__(self, message: str):
+        super().__init__(message, status_code=500)

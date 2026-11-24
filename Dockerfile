@@ -12,8 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-# 非 root 运行
-RUN useradd --create-home --uid 10001 appuser
+# 非 root 运行；/srv/data 是命名卷挂载点（存放初始化好的持久卷），
+# 提前建好后 chown，Docker 会用镜像里的属主初始化新命名卷。
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /srv/data/volumes \
+    && chown -R appuser:appuser /srv/data
 USER appuser
 
 EXPOSE 8000

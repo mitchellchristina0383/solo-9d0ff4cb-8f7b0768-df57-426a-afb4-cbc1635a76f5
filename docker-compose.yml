@@ -7,6 +7,12 @@ services:
       - "8000:8000"
     restart: unless-stopped
     read_only: true
+    environment:
+      # 持久卷根目录：初始化好的命名卷落盘在这里
+      VOLUME_ROOT: /srv/data/volumes
+    volumes:
+      # 命名卷持久化：容器重建后已初始化的卷仍在
+      - volume-data:/srv/data
     tmpfs:
       - /tmp:size=64m
     healthcheck:
@@ -14,3 +20,6 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+volumes:
+  volume-data:
